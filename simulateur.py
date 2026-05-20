@@ -424,29 +424,134 @@ def ecran_admin_ajout():
     time.sleep(1.5)
 
 
-def ecran_admin_liste():
+def modifier_question(index, q_modif):
+    """Remplace la question a l'index donne et recrit le fichier."""
     banque = charger_questions()
+    if index < 0 or index >= len(banque):
+        return False
+    banque[index] = q_modif
+    with open(FICHIER_QUESTIONS, "w", encoding="utf-8") as f:
+        for q in banque:
+            f.write(q["enonce"] + "\n")
+            for c in q["choix"]:
+                f.write(c + "\n")
+            f.write(q["reponse"] + "\n")
+    return True
+
+
+def ecran_admin_liste():
+    page = 0
+    par_page = 10
+
+    while True:
+        banque = charger_questions()
+        effacer()
+        bandeau()
+        print()
+        print(centrer("LISTE DES QUESTIONS EN BASE"))
+        ligne_h('-')
+        print()
+
+        if not banque:
+            print("  Aucune question enregistree.")
+            pied_page("  [ENTREE] Retour au menu admin")
+            pause("")
+            return
+
+        nb_pages = (len(banque) + par_page - 1) // par_page
+        if page >= nb_pages:
+            page = 0
+        debut = page * par_page
+        fin   = min(debut + par_page, len(banque))
+
+        for i in range(debut, fin):
+            apercu = banque[i]["enonce"][:30] + ".." \
+                     if len(banque[i]["enonce"]) > 30 \
+                     else banque[i]["enonce"]
+            print(f"  Q{i+1:02d}: {apercu}")
+
+        print()
+        print(f"  Total : {len(banque)} question(s)   Page {page+1}/{nb_pages}")
+        pied_page(
+            "  Numero a editer, [S] Pg.suiv, [ENTREE] Menu"
+        )
+        choix = input("\n  > ").strip().upper()
+
+        if choix == '':
+            return
+        elif choix == 'S':
+            page += 1
+            if page >= nb_pages:
+                page = 0
+        elif choix.isdigit():
+            num = int(choix)
+            if 1 <= num <= len(banque):
+                ecran_admin_edition(num - 1, banque[num - 1])
+            else:
+                print("  Numero invalide !")
+                time.sleep(1)
+
+
+def ecran_admin_edition(index, q_orig):
+    """Formulaire d'edition pre-rempli pour une question existante."""
+
+    # --- Etape 1 : Enonce ---
     effacer()
     bandeau()
     print()
-    print(centrer("LISTE DES QUESTIONS EN BASE"))
+    print(centrer(f"EDITION Q{index+1:02d} (1/3)"))
     ligne_h('-')
     print()
-
-    if not banque:
-        print("  Aucune question enregistree.")
-        pied_page("  [ENTREE] Retour au menu admin")
-        pause("")
-        return
-
-    for i, q in enumerate(banque):
-        apercu = q["enonce"][:34] + ".." if len(q["enonce"]) > 34 else q["enonce"]
-        print(f"  Q{i+1:02d}: {apercu}")
-
+    print("  Enonce actuel :")
+    print(f"  {q_orig['enonce']}")
     print()
-    print(f"  Total : {len(banque)} question(s)")
-    pied_page("  [ENTREE] Retour au menu admin")
-    pause("")
+    print("  Nouvel enonce (ENTREE = garder) :")
+    val = saisir("  > ", max_len=72).strip()
+    enonce = val if val else q_orig["enonce"]
+
+    # --- Etape 2 : Choix ---
+    effacer()
+    bandeau()
+    print()
+    print(centrer(f"EDITION Q{index+1:02d} (2/3)"))
+    ligne_h('-')
+    print()
+    print("  Actuel -> Nouveau (ENTREE = garder)")
+    print()
+    choix = []
+    for i, lettre in enumerate(['A', 'B', 'C', 'D']):
+        print(f"  {lettre}/ actuel : {q_orig['choix'][i]}")
+        val = saisir(f"  {lettre}/ nouveau : ", max_len=30).strip()
+        choix.append(val if val else q_orig["choix"][i])
+        print()
+
+    # --- Etape 3 : Bonne reponse ---
+    effacer()
+    bandeau()
+    print()
+    print(centrer(f"EDITION Q{index+1:02d} (3/3)"))
+    ligne_h('-')
+    print()
+    print(f"  Reponse actuelle : {q_orig['reponse']}")
+    print()
+    while True:
+        val = saisir("  Nouvelle reponse (A/B/C/D, ENTREE = garder) : ").strip().upper()
+        if val == '':
+            reponse = q_orig["reponse"]
+            break
+        if val in ('A', 'B', 'C', 'D'):
+            reponse = val
+            break
+        print("  Entrez A, B, C ou D uniquement.")
+
+    q_modif = {"enonce": enonce, "choix": choix, "reponse": reponse}
+    if modifier_question(index, q_modif):
+        print()
+        print(centrer("QUESTION MISE A JOUR !"))
+    else:
+        print()
+        print(centrer("ERREUR DE SAUVEGARDE !"))
+    time.sleep(1.5)
 
 
 # =============================================================

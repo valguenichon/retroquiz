@@ -691,8 +691,12 @@ void afficherAdminAjoutReponse() {
 }
 
 // ============================================================
-// ECRAN : ADMIN - LISTE DES QUESTIONS
+// ECRAN : ADMIN - LISTE DES QUESTIONS (avec selection pour edition)
 // ============================================================
+
+// Index de la page courante pour la pagination (10 questions par page)
+static int pageListeAdmin = 0;
+
 void afficherAdminListeQuestions() {
     Question banque[MAX_BANQUE_QUESTIONS];
     int total = chargerQuestions(banque);
@@ -713,32 +717,196 @@ void afficherAdminListeQuestions() {
         return;
     }
 
-    // Afficher les 14 premieres questions (limite ecran)
-    int affichees = min(total, 14);
-    for (int i = 0; i < affichees; i++) {
-        minitel.moveCursorXY(1, 6 + i);
+    // Pagination : 10 questions par page
+    int nbPages    = (total + 9) / 10;
+    if (pageListeAdmin >= nbPages) pageListeAdmin = 0;
+    int debut      = pageListeAdmin * 10;
+    int fin        = min(debut + 10, total);
+
+    for (int i = debut; i < fin; i++) {
+        minitel.moveCursorXY(1, 6 + (i - debut));
         char ligne[41];
-        // Tronquer l'enonce a 34 chars
         String apercu = banque[i].enonce;
-        if ((int)apercu.length() > 32) apercu = apercu.substring(0, 32) + "..";
+        if ((int)apercu.length() > 30) apercu = apercu.substring(0, 30) + "..";
         sprintf(ligne, " Q%02d: ", i + 1);
         minitel.print(ligne);
         minitel.println(apercu);
     }
 
-    char totalMsg[30];
-    sprintf(totalMsg, "  Total : %d question(s)", total);
-    minitel.moveCursorXY(1, 21);
+    char totalMsg[40];
+    sprintf(totalMsg, "  Total : %d question(s)  Page %d/%d",
+            total, pageListeAdmin + 1, nbPages);
+    minitel.moveCursorXY(1, 20);
     minitel.println(totalMsg);
 
-    piedPage("  [SOMMAIRE] Retour au menu admin");
+    minitel.moveCursorXY(1, 21);
+    minitel.print("  Numero a editer : [");
+    minitel.moveCursorXY(37, 21);
+    minitel.print("]");
+
+    piedPage("  [SUITE] Pg.suiv  [SOMMAIRE] Menu admin");
     ecranCourant = ADMIN_LISTE_QUESTIONS;
 }
 
 void gererAdminListeQuestions(unsigned long touche) {
     if (touche == SOMMAIRE) {
+        pageListeAdmin = 0;
         afficherAdminMenu();
+        return;
     }
+    if (touche == SUITE) {
+        pageListeAdmin++;
+        afficherAdminListeQuestions();
+        return;
+    }
+    // Chiffres 1-9 : debut de saisie du numero
+    if (touche >= '1' && touche <= '9') {
+        // Afficher le premier chiffre et lire la suite
+        char buffer[4] = { (char)touche, 0, 0, 0 };
+        minitel.moveCursorXY(22, 21);
+        minitel.print(String((char)touche));
+
+        // Lire un eventuel 2eme chiffre (pour Q10, Q11...)
+        unsigned long t2 = minitel.getKeyCode();
+        if (t2 >= '0' && t2 <= '9') {
+            buffer[1] = (char)t2;
+            buffer[2] = '\0';
+            minitel.print(String((char)t2));
+        } else if (t2 != ENVOI && t2 != SUITE) {
+            return; // Touche inconnue, on annule
+        }
+
+        int num = atoi(buffer); // numero base 1
+        if (num < 1) return;
+
+        Question banque[MAX_BANQUE_QUESTIONS];
+        int total = chargerQuestions(banque);
+        if (num > total) {
+            minitel.moveCursorXY(1, 22);
+            minitel.attributs(CARACTERE_ROUGE);
+            minitel.print("  Numero invalide !");
+            minitel.attributs(CARACTERE_BLANC);
+            delay(1000);
+            afficherAdminListeQuestions();
+            return;
+        }
+        afficherAdminEditionQuestion(num - 1); // index base 0
+    }
+}
+
+// ============================================================
+// ECRAN : ADMIN - EDITION D'UNE QUESTION EXISTANTE
+// ============================================================
+void afficherAdminEditionQuestion(int index) {
+    Question banque[MAX_BANQUE_QUESTIONS];
+    int total = chargerQuestions(banque);
+    if (index < 0 || index >= total) {
+        afficherAdminListeQuestions();
+        return;
+    }
+
+    // Travailler sur une copie
+    Question q = banque[index];
+
+    // --- Etape 1 : Enonce ---
+    minitel.newScreen();
+    bandeauTitre("3615 RETROQUIZ");
+    minitel.moveCursorXY(1, 3);
+    char titre[41];
+    sprintf(titre, "EDITION Q%02d (1/3)", index + 1);
+    minitel.println(centrer(String(titre)));
+    minitel.moveCursorXY(1, 4);
+    ligneHorizontale('-');
+    minitel.moveCursorXY(1, 6);
+    minitel.println("  Enonce actuel :");
+    minitel.moveCursorXY(1, 7);
+    minitel.attributs(CARACTERE_CYAN);
+    minitel.println("  " + q.enonce);
+    minitel.attributs(CARACTERE_BLANC);
+    minitel.moveCursorXY(1, 10);
+    minitel.println("  Nouvel enonce (ENTREE = garder) :");
+    minitel.moveCursorXY(1, 12);
+    minitel.print("  > ");
+    for (int i = 0; i < 35; i++) minitel.print("_");
+    piedPage("  [SUITE] Suivant    [SOMMAIRE] Annuler");
+
+    char bufEnonce[80] = "";
+    unsigned long fin = saisirChaine(5, 12, 35, bufEnonce);
+    if (fin == SOMMAIRE) { afficherAdminListeQuestions(); return; }
+    if (strlen(bufEnonce) > 0) q.enonce = String(bufEnonce);
+
+    // --- Etape 2 : Choix A/B/C/D ---
+    minitel.newScreen();
+    bandeauTitre("3615 RETROQUIZ");
+    minitel.moveCursorXY(1, 3);
+    sprintf(titre, "EDITION Q%02d (2/3)", index + 1);
+    minitel.println(centrer(String(titre)));
+    minitel.moveCursorXY(1, 4);
+    ligneHorizontale('-');
+    minitel.moveCursorXY(1, 5);
+    minitel.println("  Actuel -> Nouveau (ENTREE = garder)");
+
+    const char lettres[] = {'A', 'B', 'C', 'D'};
+    for (int i = 0; i < 4; i++) {
+        int ligne = 7 + i * 3;
+        minitel.moveCursorXY(1, ligne);
+        minitel.attributs(CARACTERE_CYAN);
+        char label[42];
+        sprintf(label, "  %c/ %s", lettres[i], q.choix[i].c_str());
+        minitel.println(label);
+        minitel.attributs(CARACTERE_BLANC);
+        minitel.moveCursorXY(1, ligne + 1);
+        minitel.print("  > ");
+        for (int j = 0; j < 30; j++) minitel.print("_");
+
+        char bufChoix[32] = "";
+        unsigned long fc = saisirChaine(5, ligne + 1, 30, bufChoix);
+        if (fc == SOMMAIRE) { afficherAdminListeQuestions(); return; }
+        if (strlen(bufChoix) > 0) q.choix[i] = String(bufChoix);
+    }
+
+    // --- Etape 3 : Bonne reponse ---
+    minitel.newScreen();
+    bandeauTitre("3615 RETROQUIZ");
+    minitel.moveCursorXY(1, 3);
+    sprintf(titre, "EDITION Q%02d (3/3)", index + 1);
+    minitel.println(centrer(String(titre)));
+    minitel.moveCursorXY(1, 4);
+    ligneHorizontale('-');
+    minitel.moveCursorXY(1, 7);
+    minitel.print("  Reponse actuelle : ");
+    minitel.attributs(CARACTERE_CYAN);
+    minitel.println(String(q.bonneReponse));
+    minitel.attributs(CARACTERE_BLANC);
+    minitel.moveCursorXY(1, 9);
+    minitel.println("  Nouvelle reponse (A/B/C/D) :");
+    minitel.moveCursorXY(1, 11);
+    minitel.print("  Lettre : [_]");
+    piedPage("  [ENVOI] SAUVEGARDER    [SOMMAIRE] Annuler");
+
+    char bufRep[4] = "";
+    unsigned long fr = saisirChaine(12, 11, 1, bufRep);
+    if (fr == SOMMAIRE) { afficherAdminListeQuestions(); return; }
+
+    char rep = toupper(bufRep[0]);
+    if (rep == 'A' || rep == 'B' || rep == 'C' || rep == 'D') {
+        q.bonneReponse = rep;
+    }
+
+    // Sauvegarde
+    if (modifierQuestion(index, q)) {
+        minitel.moveCursorXY(1, 15);
+        minitel.attributs(CARACTERE_VERT);
+        minitel.println(centrer("QUESTION MISE A JOUR !"));
+        minitel.attributs(CARACTERE_BLANC);
+    } else {
+        minitel.moveCursorXY(1, 15);
+        minitel.attributs(CARACTERE_ROUGE);
+        minitel.println(centrer("ERREUR DE SAUVEGARDE !"));
+        minitel.attributs(CARACTERE_BLANC);
+    }
+    delay(1500);
+    afficherAdminListeQuestions();
 }
 
 // ============================================================
