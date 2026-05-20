@@ -1,0 +1,60 @@
+En quelle annee le Minitel a-t-il ete lance officiellement en France ?
+1978
+1982
+1989
+1995
+B
+Quel etait le numero mythique pour acceder aux services Minitel ?
+3611
+3614
+3615
+3617
+C
+Quelle est la largeur standard de l'ecran Minitel en colonnes ?
+20 colonnes
+40 colonnes
+80 colonnes
+120 colonnes
+B
+Quel composant est au coeur du Minimit ?
+Un Raspberry Pi
+Un Arduino Uno
+Un ESP32
+Un Atmel AVR
+C
+Quel systeme de fichiers est utilise pour stocker les donnees sur le Minimit ?
+SD Card
+EEPROM brute
+LittleFS
+FAT32
+C
+Quelle est la hauteur standard de l'ecran Minitel en lignes ?
+12 lignes
+18 lignes
+24 lignes
+32 lignes
+C
+Quel protocole de communication utilise le Minitel pour afficher du contenu ?
+HTML
+Videotex (Teletel)
+FTP
+Telnet
+B
+En quelle annee le service Minitel a-t-il ete definitivement arrete en France ?
+2005
+2009
+2012
+2017
+C
+Quel organisme a developpe et deploye le Minitel en France ?
+L'ORTF
+France Telecom (PTT)
+Le Minitel Club
+Thomson Multimedia
+B
+A quelle vitesse en bauds le Minimit communique-t-il avec le Minitel ?
+1200 bauds
+2400 bauds
+4800 bauds
+9600 bauds
+C
