@@ -1,949 +1,866 @@
 // ============================================================
-//  3615 RETROQUIZ
-//  Plateforme : Minimit (ESP32) + Minitel physique
-//  Librairie  : Minitel1B_Hard (version Minimit)
-//  Stockage   : LittleFS
+//  RETROQUIZ.INO
+//  Service 3615 RETROQUIZ pour le Minimit
+//  Patron : setupRetroquiz() + loopRetroquiz()
+//  Pas de WiFi requis — fonctionne entierement hors ligne.
+//  Variables globales Minimit utilisees :
+//    touche, userInput, userInputLength, currentEcran
+//  Fonctions Minimit utilisees :
+//    wait_for_user_action(), champVide(), initMinitelService()
 // ============================================================
 
-#include <Minitel1B_Hard.h>
-#include "donnees.h"
+#include "donnees_rq.h"
 
 // ============================================================
-// CONFIGURATION MATERIELLE
+// VARIABLES LOCALES AU SERVICE
+// Prefixe rq_ pour eviter tout conflit avec les autres services
 // ============================================================
-Minitel minitel(Serial2); // Le Minimit utilise toujours Serial2
+static RQ_Question  rq_banque[RQ_MAX_BANQUE];
+static int          rq_totalBanque     = 0;
+static int          rq_indices[RQ_NB_QUESTIONS_PARTIE];
+static int          rq_questionNum     = 0;   // 0..9
+static int          rq_score           = 0;
+static char         rq_reponse         = 0;   // 'A'..'D' ou 0
+static char         rq_pseudo[RQ_MAX_PSEUDO + 1] = "";
+static char         rq_mdpSaisi[8]     = "";
+static int          rq_pageAdmin       = 0;
+static RQ_Question  rq_editQ;                 // question en cours d'edition
 
 // ============================================================
-// MACHINE A ETATS
-// ============================================================
-enum Ecran {
-    ACCUEIL,
-    JEU,
-    CONFIRMATION_ABANDON,
-    RESULTATS,
-    LEADERBOARD,
-    ADMIN_MDP,
-    ADMIN_MENU,
-    ADMIN_AJOUT_ENONCE,
-    ADMIN_AJOUT_CHOIX,
-    ADMIN_AJOUT_REPONSE,
-    ADMIN_LISTE_QUESTIONS,
-    ADMIN_CONFIRM_RESET
-};
-
-Ecran ecranCourant = ACCUEIL;
-
-// ============================================================
-// ETAT DU JEU
-// ============================================================
-Question    banqueQuestions[MAX_BANQUE_QUESTIONS];
-int         totalBanque        = 0;
-int         indicesPartie[NB_QUESTIONS_PARTIE];
-int         questionEnCours    = 0;  // 0..9
-int         scoreJoueur        = 0;
-char        reponseSelectionnee = 0; // 'A'..'D' ou 0 si rien
-char        pseudoJoueur[MAX_PSEUDO + 1] = "";
-
-// Etat admin
-char        mdpSaisi[8]        = "";
-int         mdpPos             = 0;
-Question    nouvelleQuestion;
-int         etapeAjout         = 0; // 0=enonce, 1=choix, 2=reponse
-int         champChoixActif    = 0; // 0..3 pour les 4 choix
-String      champEnCours       = "";
-
-// ============================================================
-// UTILITAIRES D'AFFICHAGE
+// UTILITAIRES AFFICHAGE
 // ============================================================
 
-// Centre un texte dans 40 colonnes
-String centrer(const String& texte, int largeur = 40) {
-    int padding = (largeur - texte.length()) / 2;
-    if (padding < 0) padding = 0;
-    String result = "";
-    for (int i = 0; i < padding; i++) result += " ";
-    result += texte;
-    return result;
+// Positionne et efface une zone de saisie de longueur donnee
+static void rq_champSaisie(int x, int y, int len) {
+    minitel.newXY(x, y);
+    for (int i = 0; i < len; i++) minitel.print(".");
+    minitel.newXY(x, y);
+    minitel.cursor();
 }
 
-// Affiche une ligne horizontale de separateurs
-void ligneHorizontale(char c = '-', int largeur = 40) {
-    String ligne = "";
-    for (int i = 0; i < largeur; i++) ligne += c;
-    minitel.println(ligne);
+// Affiche une chaine centree sur 40 colonnes a la position y
+static void rq_centrer(const String& txt, int y) {
+    int pad = (40 - (int)txt.length()) / 2;
+    if (pad < 0) pad = 0;
+    minitel.newXY(1 + pad, y);
+    minitel.print(txt);
 }
 
-// Bandeau titre en haut de chaque ecran
-void bandeauTitre(const String& titre, int score = -1) {
-    minitel.moveCursorXY(1, 1);
+// Ligne horizontale de 40 caracteres
+static void rq_ligneH(int y, char c = '-') {
+    minitel.newXY(1, y);
+    for (int i = 0; i < 40; i++) minitel.print(String(c));
+}
+
+// Bandeau haut commun a tous les ecrans du service
+static void rq_bandeau(int numQ = 0) {
+    minitel.newXY(1, 1);
     minitel.attributs(FOND_BLEU);
     minitel.attributs(CARACTERE_JAUNE);
-    String ligne = "3615 RETROQUIZ";
-    if (score >= 0) {
-        char compteur[10];
-        sprintf(compteur, "[%02d/10]", score);
-        // Remplir jusqu'a la colonne 34 puis afficher le compteur
-        while ((int)ligne.length() < 33) ligne += " ";
-        ligne += compteur;
+    if (numQ > 0) {
+        char buf[41];
+        sprintf(buf, "3615 RETROQUIZ              [%02d/%02d]",
+                numQ, RQ_NB_QUESTIONS_PARTIE);
+        minitel.print(buf);
     } else {
-        while ((int)ligne.length() < 40) ligne += " ";
+        minitel.print("3615 RETROQUIZ                        ");
     }
-    minitel.print(ligne);
     minitel.attributs(FOND_NOIR);
     minitel.attributs(CARACTERE_BLANC);
 }
 
-// Pied de page (ligne 23-24)
-void piedPage(const String& ligne1, const String& ligne2 = "") {
-    minitel.moveCursorXY(1, 23);
-    ligneHorizontale();
-    minitel.println(ligne1);
-    if (ligne2.length() > 0) minitel.print(ligne2);
+// Pied de page : ligne 23 = separateur, ligne 24 = aide touches
+static void rq_pied(const String& aide) {
+    rq_ligneH(23);
+    minitel.newXY(1, 24);
+    minitel.attributs(CARACTERE_CYAN);
+    minitel.print(aide);
+    minitel.attributs(CARACTERE_BLANC);
 }
 
-// Efface une zone de saisie et repositionne le curseur
-void effacerChamp(int x, int y, int longueur) {
-    minitel.moveCursorXY(x, y);
-    for (int i = 0; i < longueur; i++) minitel.print(" ");
-    minitel.moveCursorXY(x, y);
-}
-
-// Saisie d'une chaine avec echo (retourne la chaine finale)
-// La touche CORRECTION efface le dernier caractere.
-// La touche ENVOI ou SUITE termine la saisie.
-// Retourne le code de la touche de fin (ENVOI, SUITE, SOMMAIRE...)
-unsigned long saisirChaine(int x, int y, int maxLen, char* buffer,
-                            bool masquer = false) {
+// Saisie bloquante d'une chaine (max maxLen caracteres).
+// Gere CORRECTION et se termine sur ENVOI, SUITE ou SOMMAIRE.
+// Retourne le code de la touche de fin.
+// NB : n'utilise PAS wait_for_user_action() pour avoir l'echo masquable.
+static unsigned long rq_saisir(int x, int y, int maxLen,
+                                char* buf, bool masquer = false) {
     int pos = 0;
-    buffer[0] = '\0';
-    minitel.moveCursorXY(x, y);
+    buf[0] = '\0';
+    minitel.newXY(x, y);
     minitel.cursor();
+    minitel.echo(false);
 
     while (true) {
-        unsigned long touche = minitel.getKeyCode();
-
-        if (touche == CORRECTION) {
+        unsigned long t = minitel.getKeyCode();
+        if (t == CORRECTION) {
             if (pos > 0) {
                 pos--;
-                buffer[pos] = '\0';
-                minitel.moveCursorXY(x + pos, y);
-                minitel.print(" ");
-                minitel.moveCursorXY(x + pos, y);
+                buf[pos] = '\0';
+                minitel.moveCursorLeft(1);
+                minitel.print(".");
+                minitel.moveCursorLeft(1);
             }
-        } else if (touche == ENVOI || touche == SUITE ||
-                   touche == SOMMAIRE || touche == RETOUR) {
+        } else if (t == ENVOI || t == SUITE || t == SOMMAIRE || t == CONNEXION_FIN) {
             minitel.noCursor();
-            return touche;
-        } else if (touche >= 0x20 && touche <= 0x7E && pos < maxLen) {
-            // Caractere imprimable
-            buffer[pos] = (char)touche;
-            pos++;
-            buffer[pos] = '\0';
-            if (masquer) minitel.print("*");
-            else         minitel.print(String((char)touche));
+            minitel.echo(false);
+            return t;
+        } else if (t >= 0x20 && t <= 0x7E && pos < maxLen) {
+            buf[pos++] = (char)t;
+            buf[pos]   = '\0';
+            minitel.print(masquer ? "*" : String((char)t));
         }
     }
 }
 
 // ============================================================
-// ECRAN : ACCUEIL
+// ECRAN ACCUEIL DU SERVICE
 // ============================================================
-void afficherAccueil() {
+static void rq_afficheAccueil() {
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
+    rq_bandeau();
+    currentEcran = "RQ_ACCUEIL";
 
-    // Titre graphique (double hauteur)
-    minitel.moveCursorXY(1, 3);
+    // Titre double hauteur
+    minitel.newXY(1, 3);
     minitel.attributs(DOUBLE_HAUTEUR);
     minitel.attributs(CARACTERE_CYAN);
-    minitel.println(centrer("3615 RETROQUIZ"));
+    rq_centrer("** 3615 RETROQUIZ **", 3);
     minitel.attributs(CARACTERE_BLANC);
 
-    // Sous-titre
-    minitel.moveCursorXY(1, 6);
-    minitel.println(centrer("Le quiz du Minitel !"));
+    minitel.newXY(1, 6);
+    rq_centrer("Le quiz du Minitel !", 6);
+    rq_ligneH(8, '=');
 
-    // Separateur mosaique
-    minitel.moveCursorXY(1, 8);
-    ligneHorizontale('=');
-
-    // Menu
-    minitel.moveCursorXY(1, 11);
+    minitel.newXY(1, 11);
     minitel.attributs(CARACTERE_VERT);
-    minitel.println("  [ 1 ]  JOUER AU QUIZ");
-    minitel.moveCursorXY(1, 13);
-    minitel.println("  [ 2 ]  LEADERBOARD");
+    minitel.print("  [ 1 ]  JOUER AU QUIZ");
+    minitel.newXY(1, 13);
+    minitel.print("  [ 2 ]  LEADERBOARD");
     minitel.attributs(CARACTERE_BLANC);
 
-    piedPage("  Tapez votre choix puis [ENVOI]",
-             "  (Touche 9 : acces admin)");
-
-    ecranCourant = ACCUEIL;
-}
-
-void gererAccueil(unsigned long touche) {
-    if (touche == '1') {
-        demarrerPartie();
-    } else if (touche == '2') {
-        afficherLeaderboard();
-    } else if (touche == '9') {
-        afficherAdminMdp();
-    }
+    rq_pied("  1/2=Menu  9=Admin  CNX/FIN=Quitter");
+    champVide(14, 17, 20);
 }
 
 // ============================================================
-// ECRAN : JEU
+// ECRAN JEU
 // ============================================================
-void demarrerPartie() {
-    totalBanque = chargerQuestions(banqueQuestions);
-    if (totalBanque < NB_QUESTIONS_PARTIE) {
-        // Pas assez de questions
-        minitel.newScreen();
-        bandeauTitre("3615 RETROQUIZ");
-        minitel.moveCursorXY(1, 10);
-        minitel.attributs(CARACTERE_ROUGE);
-        char msg[50];
-        sprintf(msg, "  ERREUR : il faut au moins %d questions !", NB_QUESTIONS_PARTIE);
-        minitel.println(msg);
-        minitel.attributs(CARACTERE_BLANC);
-        minitel.moveCursorXY(1, 12);
-        minitel.println("  Allez en mode ADMIN pour en ajouter.");
-        piedPage("  [SOMMAIRE] Retour a l'accueil");
-        ecranCourant = LEADERBOARD; // On reutilise SOMMAIRE -> accueil
-        return;
-    }
-
-    tirerQuestions(banqueQuestions, totalBanque, indicesPartie);
-    questionEnCours = 0;
-    scoreJoueur     = 0;
-    afficherQuestion();
-}
-
-void afficherQuestion() {
-    int idxQ = indicesPartie[questionEnCours];
-    Question& q = banqueQuestions[idxQ];
-    reponseSelectionnee = 0;
+static void rq_afficheQuestion() {
+    RQ_Question& q = rq_banque[rq_indices[rq_questionNum]];
+    rq_reponse = 0;
 
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ", questionEnCours + 1);
+    rq_bandeau(rq_questionNum + 1);
+    currentEcran = "RQ_JEU";
 
     // Enonce
-    minitel.moveCursorXY(1, 3);
+    minitel.newXY(1, 3);
     minitel.attributs(CARACTERE_CYAN);
-    minitel.println(q.enonce);
+    minitel.print("  " + q.enonce);
     minitel.attributs(CARACTERE_BLANC);
 
-    // Separateur
-    minitel.moveCursorXY(1, 7);
-    ligneHorizontale('-');
+    rq_ligneH(7);
 
     // Choix A/B/C/D
-    const char lettres[] = {'A', 'B', 'C', 'D'};
+    const char lettres[] = {'A','B','C','D'};
     for (int i = 0; i < 4; i++) {
-        minitel.moveCursorXY(1, 9 + i * 2);
-        char ligne[44];
-        sprintf(ligne, "  %c/ ", lettres[i]);
-        minitel.print(ligne);
-        minitel.println(q.choix[i]);
-    }
-
-    // Zone de reponse
-    minitel.moveCursorXY(1, 19);
-    minitel.print("  Votre reponse (A, B, C ou D) : ");
-    minitel.moveCursorXY(35, 19);
-    minitel.print("[_]");
-
-    piedPage("  [SUITE] Valider    [SOMMAIRE] Abandonner");
-
-    ecranCourant = JEU;
-}
-
-void gererJeu(unsigned long touche) {
-    if (touche == 'A' || touche == 'a' ||
-        touche == 'B' || touche == 'b' ||
-        touche == 'C' || touche == 'c' ||
-        touche == 'D' || touche == 'd') {
-        // Mise a jour de la reponse selectionnee
-        reponseSelectionnee = toupper((char)touche);
-        minitel.moveCursorXY(36, 19);
-        minitel.attributs(CARACTERE_JAUNE);
-        minitel.print(String(reponseSelectionnee));
-        minitel.attributs(CARACTERE_BLANC);
-
-    } else if (touche == SUITE) {
-        if (reponseSelectionnee == 0) {
-            // Aucune reponse selectionnee
-            minitel.moveCursorXY(1, 21);
-            minitel.attributs(CARACTERE_ROUGE);
-            minitel.print("  Selectionnez une reponse (A/B/C/D)");
-            minitel.attributs(CARACTERE_BLANC);
-            return;
-        }
-        // Verifier la reponse
-        int idxQ = indicesPartie[questionEnCours];
-        if (reponseSelectionnee == banqueQuestions[idxQ].bonneReponse) {
-            scoreJoueur++;
-            minitel.moveCursorXY(1, 21);
-            minitel.attributs(CARACTERE_VERT);
-            minitel.print("  BONNE REPONSE !");
-            minitel.attributs(CARACTERE_BLANC);
-            minitel.bip();
-        } else {
-            minitel.moveCursorXY(1, 21);
-            minitel.attributs(CARACTERE_ROUGE);
-            char msg[42];
-            sprintf(msg, "  FAUX ! Reponse : %c",
-                    banqueQuestions[idxQ].bonneReponse);
-            minitel.print(msg);
-            minitel.attributs(CARACTERE_BLANC);
-            minitel.bip();
-        }
-        delay(1200); // Laisser le joueur lire le feedback
-
-        questionEnCours++;
-        if (questionEnCours >= NB_QUESTIONS_PARTIE) {
-            afficherResultats();
-        } else {
-            afficherQuestion();
-        }
-
-    } else if (touche == SOMMAIRE) {
-        afficherConfirmationAbandon();
-    }
-}
-
-// ============================================================
-// ECRAN : CONFIRMATION ABANDON
-// ============================================================
-void afficherConfirmationAbandon() {
-    minitel.moveCursorXY(1, 10);
-    ligneHorizontale('=');
-    minitel.moveCursorXY(1, 11);
-    minitel.attributs(FOND_ROUGE);
-    minitel.attributs(CARACTERE_BLANC);
-    minitel.println(centrer("QUITTER LA PARTIE ?"));
-    minitel.moveCursorXY(1, 12);
-    minitel.println(centrer("[ENVOI] OUI     [RETOUR] NON"));
-    minitel.moveCursorXY(1, 13);
-    ligneHorizontale('=');
-    minitel.attributs(FOND_NOIR);
-    ecranCourant = CONFIRMATION_ABANDON;
-}
-
-void gererConfirmationAbandon(unsigned long touche) {
-    if (touche == ENVOI) {
-        afficherAccueil();
-    } else if (touche == RETOUR) {
-        // Reprendre la question en cours
-        afficherQuestion();
-    }
-}
-
-// ============================================================
-// ECRAN : RESULTATS
-// ============================================================
-void afficherResultats() {
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    // Titre graphique
-    minitel.moveCursorXY(1, 3);
-    minitel.attributs(DOUBLE_HAUTEUR);
-    minitel.attributs(CARACTERE_JAUNE);
-    minitel.println(centrer("** BRAVO ! **"));
-    minitel.attributs(CARACTERE_BLANC);
-
-    // Score
-    minitel.moveCursorXY(1, 7);
-    minitel.println(centrer("VOUS AVEZ REUSSI"));
-    char scoreMsg[20];
-    sprintf(scoreMsg, "%d / %d", scoreJoueur, NB_QUESTIONS_PARTIE);
-    minitel.moveCursorXY(1, 8);
-    minitel.attributs(CARACTERE_CYAN);
-    minitel.println(centrer(scoreMsg));
-    minitel.attributs(CARACTERE_BLANC);
-    minitel.moveCursorXY(1, 9);
-    minitel.println(centrer("BONNES REPONSES"));
-
-    // Zone saisie pseudo
-    minitel.moveCursorXY(1, 12);
-    ligneHorizontale('-');
-    minitel.moveCursorXY(1, 13);
-    minitel.println("  ENTREZ VOTRE PSEUDO POUR LE");
-    minitel.moveCursorXY(1, 14);
-    minitel.println("  CLASSEMENT (8 car. max) :");
-    minitel.moveCursorXY(1, 16);
-    minitel.print("  > [");
-    // Position curseur : colonne 6, ligne 16
-    minitel.moveCursorXY(35, 16);
-    minitel.print("]");
-
-    piedPage("  Saisissez votre pseudo puis [SUITE]");
-
-    // Lancer la saisie directement
-    memset(pseudoJoueur, 0, sizeof(pseudoJoueur));
-    unsigned long fin = saisirChaine(6, 16, MAX_PSEUDO, pseudoJoueur);
-
-    if (fin == SUITE || fin == ENVOI) {
-        if (strlen(pseudoJoueur) == 0) strcpy(pseudoJoueur, "ANONYME");
-        // Enregistrer le score
-        Score leaderboard[MAX_SCORES];
-        chargerLeaderboard(leaderboard);
-        insererScore(leaderboard, pseudoJoueur, scoreJoueur);
-        afficherLeaderboard();
-    } else {
-        afficherAccueil();
-    }
-}
-
-// ============================================================
-// ECRAN : LEADERBOARD
-// ============================================================
-void afficherLeaderboard() {
-    Score leaderboard[MAX_SCORES];
-    chargerLeaderboard(leaderboard);
-
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    // Titre graphique
-    minitel.moveCursorXY(1, 2);
-    minitel.attributs(DOUBLE_HAUTEUR);
-    minitel.attributs(CARACTERE_JAUNE);
-    minitel.println(centrer("** TOP 10 **"));
-    minitel.attributs(CARACTERE_BLANC);
-
-    // En-tete tableau
-    minitel.moveCursorXY(1, 5);
-    minitel.attributs(FOND_BLEU);
-    minitel.print("  RANG  PSEUDO      SCORE     ");
-    minitel.attributs(FOND_NOIR);
-
-    // Scores
-    for (int i = 0; i < MAX_SCORES; i++) {
-        minitel.moveCursorXY(1, 7 + i);
-        char ligne[41];
-
-        if (i == 0) minitel.attributs(CARACTERE_JAUNE);      // 1er : or
-        else if (i <= 2) minitel.attributs(CARACTERE_CYAN);  // Podium : cyan
-        else minitel.attributs(CARACTERE_BLANC);
-
-        sprintf(ligne, "   %2d.  %-8s    %2d / %d",
-                i + 1,
-                leaderboard[i].pseudo,
-                leaderboard[i].points,
-                NB_QUESTIONS_PARTIE);
-        minitel.println(ligne);
-    }
-    minitel.attributs(CARACTERE_BLANC);
-
-    piedPage("  [SOMMAIRE] Retour a l'accueil");
-    ecranCourant = LEADERBOARD;
-}
-
-void gererLeaderboard(unsigned long touche) {
-    if (touche == SOMMAIRE) {
-        afficherAccueil();
-    }
-}
-
-// ============================================================
-// ECRAN : ADMIN - SAISIE MOT DE PASSE
-// ============================================================
-void afficherAdminMdp() {
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    minitel.moveCursorXY(1, 5);
-    ligneHorizontale('=');
-    minitel.moveCursorXY(1, 6);
-    minitel.println(centrer("ACCES ADMINISTRATION"));
-    minitel.moveCursorXY(1, 7);
-    ligneHorizontale('=');
-
-    minitel.moveCursorXY(1, 11);
-    minitel.print("  CODE D'ACCES : [");
-    // Position : colonne 19, ligne 11 (apres le crochet)
-    minitel.moveCursorXY(37, 11);
-    minitel.print("]");
-
-    piedPage("  [ENVOI] Valider    [SOMMAIRE] Annuler");
-
-    memset(mdpSaisi, 0, sizeof(mdpSaisi));
-    // Saisie masquee (affiche des *)
-    unsigned long fin = saisirChaine(19, 11, 6, mdpSaisi, true);
-
-    if (fin == ENVOI || fin == SUITE) {
-        if (strcmp(mdpSaisi, MDP_ADMIN) == 0) {
-            afficherAdminMenu();
-        } else {
-            // Mauvais mot de passe
-            minitel.moveCursorXY(1, 14);
-            minitel.attributs(CARACTERE_ROUGE);
-            minitel.println(centrer("CODE INCORRECT !"));
-            minitel.attributs(CARACTERE_BLANC);
-            delay(1500);
-            afficherAccueil();
-        }
-    } else {
-        afficherAccueil();
-    }
-}
-
-// ============================================================
-// ECRAN : ADMIN - MENU PRINCIPAL
-// ============================================================
-void afficherAdminMenu() {
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    minitel.moveCursorXY(1, 3);
-    ligneHorizontale('=');
-    minitel.moveCursorXY(1, 4);
-    minitel.println(centrer("PANNEAU DE CONTROLE"));
-    minitel.moveCursorXY(1, 5);
-    ligneHorizontale('=');
-
-    minitel.moveCursorXY(1, 8);
-    minitel.attributs(CARACTERE_VERT);
-    minitel.println("  [ 1 ]  REINITIALISER LE LEADERBOARD");
-    minitel.moveCursorXY(1, 10);
-    minitel.println("  [ 2 ]  AJOUTER UNE QUESTION");
-    minitel.moveCursorXY(1, 12);
-    minitel.println("  [ 3 ]  VOIR / MODIFIER LES QUESTIONS");
-    minitel.moveCursorXY(1, 14);
-    minitel.attributs(CARACTERE_ROUGE);
-    minitel.println("  [ 4 ]  RETOUR A L'ACCUEIL");
-    minitel.attributs(CARACTERE_BLANC);
-
-    minitel.moveCursorXY(1, 17);
-    minitel.print("  VOTRE CHOIX : [_]");
-
-    piedPage("  Tapez 1, 2, 3 ou 4 puis [ENVOI]");
-    ecranCourant = ADMIN_MENU;
-}
-
-void gererAdminMenu(unsigned long touche) {
-    if (touche == '1') {
-        afficherAdminConfirmReset();
-    } else if (touche == '2') {
-        afficherAdminAjoutEnonce();
-    } else if (touche == '3') {
-        afficherAdminListeQuestions();
-    } else if (touche == '4') {
-        afficherAccueil();
-    }
-}
-
-// ============================================================
-// ECRAN : ADMIN - CONFIRMATION RESET LEADERBOARD
-// ============================================================
-void afficherAdminConfirmReset() {
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    minitel.moveCursorXY(1, 8);
-    minitel.attributs(FOND_ROUGE);
-    minitel.attributs(CARACTERE_BLANC);
-    minitel.println(centrer("ETES-VOUS SUR ?"));
-    minitel.moveCursorXY(1, 9);
-    minitel.println(centrer("Cette action est irreversible !"));
-    minitel.attributs(FOND_NOIR);
-    minitel.moveCursorXY(1, 12);
-    minitel.println(centrer("[ENVOI] CONFIRMER   [RETOUR] ANNULER"));
-
-    ecranCourant = ADMIN_CONFIRM_RESET;
-}
-
-void gererAdminConfirmReset(unsigned long touche) {
-    if (touche == ENVOI) {
-        reinitialiserLeaderboard();
-        minitel.moveCursorXY(1, 15);
-        minitel.attributs(CARACTERE_VERT);
-        minitel.println(centrer("LEADERBOARD REINITIALISE !"));
-        minitel.attributs(CARACTERE_BLANC);
-        delay(1500);
-        afficherAdminMenu();
-    } else if (touche == RETOUR) {
-        afficherAdminMenu();
-    }
-}
-
-// ============================================================
-// ECRAN : ADMIN - AJOUT QUESTION (Etape 1/3 : Enonce)
-// ============================================================
-void afficherAdminAjoutEnonce() {
-    nouvelleQuestion.enonce   = "";
-    nouvelleQuestion.bonneReponse = 'A';
-    for (int i = 0; i < 4; i++) nouvelleQuestion.choix[i] = "";
-    etapeAjout = 0;
-
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    minitel.moveCursorXY(1, 3);
-    minitel.println(centrer("AJOUT D'UNE QUESTION (1/3)"));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
-
-    minitel.moveCursorXY(1, 6);
-    minitel.println("  Saisissez l'enonce (2 lignes max) :");
-    minitel.moveCursorXY(1, 8);
-    minitel.print("  > ");
-    // Zone de saisie : 36 caracteres, colonne 5, ligne 8
-    for (int i = 0; i < 35; i++) minitel.print("_");
-
-    piedPage("  [SUITE] Suivant    [SOMMAIRE] Annuler");
-    ecranCourant = ADMIN_AJOUT_ENONCE;
-
-    // Saisie immediate
-    char buffer[80] = "";
-    unsigned long fin = saisirChaine(5, 8, 35, buffer);
-    if (fin == SOMMAIRE) { afficherAdminMenu(); return; }
-    nouvelleQuestion.enonce = String(buffer);
-    afficherAdminAjoutChoix();
-}
-
-// ============================================================
-// ECRAN : ADMIN - AJOUT QUESTION (Etape 2/3 : Choix)
-// ============================================================
-void afficherAdminAjoutChoix() {
-    minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-
-    minitel.moveCursorXY(1, 3);
-    minitel.println(centrer("AJOUT D'UNE QUESTION (2/3)"));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
-
-    minitel.moveCursorXY(1, 6);
-    minitel.println("  Saisissez les 4 options :");
-
-    const char lettres[] = {'A', 'B', 'C', 'D'};
-    for (int i = 0; i < 4; i++) {
-        minitel.moveCursorXY(1, 8 + i * 2);
-        char label[6];
+        minitel.newXY(1, 9 + i * 2);
+        char label[5];
         sprintf(label, "  %c/ ", lettres[i]);
         minitel.print(label);
-        for (int j = 0; j < 30; j++) minitel.print("_");
+        minitel.print(q.choix[i]);
     }
 
-    piedPage("  [SUITE] Suivant    [RETOUR] Etape prec.");
-    ecranCourant = ADMIN_AJOUT_CHOIX;
+    // Zone reponse
+    minitel.newXY(1, 19);
+    minitel.print("  Votre reponse (A/B/C/D) : [");
+    minitel.newXY(31, 19);
+    minitel.print("]");
 
-    // Saisir les 4 options une par une
-    for (int i = 0; i < 4; i++) {
-        char buffer[32] = "";
-        unsigned long fin = saisirChaine(6, 8 + i * 2, 30, buffer);
-        if (fin == SOMMAIRE) { afficherAdminMenu(); return; }
-        if (fin == RETOUR && i == 0) { afficherAdminAjoutEnonce(); return; }
-        nouvelleQuestion.choix[i] = String(buffer);
+    rq_pied("  A/B/C/D=Choisir  SUITE=Valider  SOM=Quit");
+    champVide(30, 19, 1);
+}
+
+static void rq_demarrerPartie() {
+    rq_totalBanque = rq_chargerQuestions(rq_banque);
+    if (rq_totalBanque < RQ_NB_QUESTIONS_PARTIE) {
+        minitel.newScreen();
+        rq_bandeau();
+        minitel.newXY(1, 10);
+        minitel.attributs(CARACTERE_ROUGE);
+        char msg[41];
+        sprintf(msg, "  Besoin de %d questions min (%d dispo).",
+                RQ_NB_QUESTIONS_PARTIE, rq_totalBanque);
+        minitel.print(msg);
+        minitel.attributs(CARACTERE_BLANC);
+        minitel.newXY(1, 12);
+        minitel.print("  Ajoutez des questions via l'admin (9).");
+        rq_pied("  CNX/FIN ou SOMMAIRE = retour");
+        currentEcran = "RQ_ERREUR";
+        return;
     }
-    afficherAdminAjoutReponse();
+    rq_tirerQuestions(rq_totalBanque, rq_indices);
+    rq_questionNum = 0;
+    rq_score       = 0;
+    rq_afficheQuestion();
+}
+
+static void rq_validerReponse() {
+    if (rq_reponse == 0) {
+        // Aucune reponse selectionnee : clignoter la zone
+        minitel.newXY(1, 21);
+        minitel.attributs(CARACTERE_ROUGE);
+        minitel.print("  Selectionnez A, B, C ou D !");
+        minitel.attributs(CARACTERE_BLANC);
+        return;
+    }
+    RQ_Question& q = rq_banque[rq_indices[rq_questionNum]];
+    bool correct   = (rq_reponse == q.bonneReponse);
+
+    // Feedback
+    minitel.newXY(1, 21);
+    if (correct) {
+        rq_score++;
+        minitel.attributs(CARACTERE_VERT);
+        minitel.print("  BONNE REPONSE !                      ");
+    } else {
+        minitel.attributs(CARACTERE_ROUGE);
+        char msg[41];
+        sprintf(msg, "  FAUX ! Bonne reponse : %c             ", q.bonneReponse);
+        minitel.print(msg);
+    }
+    minitel.attributs(CARACTERE_BLANC);
+    minitel.bip();
+    delay(1200);
+
+    rq_questionNum++;
+    if (rq_questionNum >= RQ_NB_QUESTIONS_PARTIE) {
+        currentEcran = "RQ_RESULTATS";
+    } else {
+        rq_afficheQuestion();
+    }
 }
 
 // ============================================================
-// ECRAN : ADMIN - AJOUT QUESTION (Etape 3/3 : Bonne reponse)
+// ECRAN RESULTATS + SAISIE PSEUDO
 // ============================================================
-void afficherAdminAjoutReponse() {
+static void rq_afficheResultats() {
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
+    rq_bandeau();
+    currentEcran = "RQ_RESULTATS";
 
-    minitel.moveCursorXY(1, 3);
-    minitel.println(centrer("AJOUT D'UNE QUESTION (3/3)"));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
+    minitel.newXY(1, 3);
+    minitel.attributs(DOUBLE_HAUTEUR);
+    minitel.attributs(CARACTERE_JAUNE);
+    rq_centrer("** BRAVO ! **", 3);
+    minitel.attributs(CARACTERE_BLANC);
 
-    minitel.moveCursorXY(1, 7);
-    minitel.println("  Quelle est la bonne reponse ?");
-    minitel.moveCursorXY(1, 9);
-    minitel.print("  Lettre (A, B, C ou D) : [_]");
+    minitel.newXY(1, 7);
+    rq_centrer("VOUS AVEZ REUSSI", 7);
+    char sc[20];
+    sprintf(sc, "%d / %d BONNES REPONSES", rq_score, RQ_NB_QUESTIONS_PARTIE);
+    minitel.attributs(CARACTERE_CYAN);
+    rq_centrer(String(sc), 8);
+    minitel.attributs(CARACTERE_BLANC);
 
-    piedPage("  [ENVOI] SAUVEGARDER    [SOMMAIRE] Annuler");
-    ecranCourant = ADMIN_AJOUT_REPONSE;
+    rq_ligneH(11);
+    minitel.newXY(1, 12);
+    minitel.print("  Votre pseudo pour le classement :");
+    minitel.newXY(1, 13);
+    minitel.print("  (8 car. max, SUITE pour valider)");
+    minitel.newXY(1, 15);
+    minitel.print("  > [");
+    minitel.newXY(35, 15);
+    minitel.print("]");
+    rq_pied("  Saisissez votre pseudo puis SUITE");
 
-    char buffer[4] = "";
-    unsigned long fin = saisirChaine(28, 9, 1, buffer);
+    // Saisie directe (bloquante)
+    memset(rq_pseudo, 0, sizeof(rq_pseudo));
+    unsigned long fin = rq_saisir(5, 15, RQ_MAX_PSEUDO, rq_pseudo);
 
-    if (fin == SOMMAIRE) { afficherAdminMenu(); return; }
+    if (fin == CONNEXION_FIN) { currentEcran = "RQ_FIN"; return; }
+    if (strlen(rq_pseudo) == 0) strcpy(rq_pseudo, "ANONYME");
 
-    char rep = toupper(buffer[0]);
-    if (rep == 'A' || rep == 'B' || rep == 'C' || rep == 'D') {
-        nouvelleQuestion.bonneReponse = rep;
-    } else {
-        nouvelleQuestion.bonneReponse = 'A';
-    }
+    RQ_Score lb[RQ_MAX_SCORES];
+    rq_chargerLeaderboard(lb);
+    bool entre = rq_insererScore(lb, rq_pseudo, rq_score);
 
-    // Sauvegarde
-    if (sauvegarderNouvelleQuestion(nouvelleQuestion)) {
-        minitel.moveCursorXY(1, 14);
+    // Feedback insertion
+    minitel.newXY(1, 18);
+    if (entre) {
         minitel.attributs(CARACTERE_VERT);
-        minitel.println(centrer("QUESTION SAUVEGARDEE !"));
-        minitel.attributs(CARACTERE_BLANC);
-    } else {
-        minitel.moveCursorXY(1, 14);
-        minitel.attributs(CARACTERE_ROUGE);
-        minitel.println(centrer("ERREUR DE SAUVEGARDE !"));
+        char msg[41];
+        sprintf(msg, "  %s entre dans le TOP 10 !", rq_pseudo);
+        minitel.print(msg);
         minitel.attributs(CARACTERE_BLANC);
     }
     delay(1500);
-    afficherAdminMenu();
+    currentEcran = "RQ_LEADERBOARD";
 }
 
 // ============================================================
-// ECRAN : ADMIN - LISTE DES QUESTIONS (avec selection pour edition)
+// ECRAN LEADERBOARD
 // ============================================================
-
-// Index de la page courante pour la pagination (10 questions par page)
-static int pageListeAdmin = 0;
-
-void afficherAdminListeQuestions() {
-    Question banque[MAX_BANQUE_QUESTIONS];
-    int total = chargerQuestions(banque);
+static void rq_afficheLeaderboard() {
+    RQ_Score lb[RQ_MAX_SCORES];
+    rq_chargerLeaderboard(lb);
 
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
+    rq_bandeau();
+    currentEcran = "RQ_LEADERBOARD";
 
-    minitel.moveCursorXY(1, 3);
-    minitel.println(centrer("LISTE DES QUESTIONS EN BASE"));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
+    minitel.newXY(1, 2);
+    minitel.attributs(DOUBLE_HAUTEUR);
+    minitel.attributs(CARACTERE_JAUNE);
+    rq_centrer("** TOP 10 **", 2);
+    minitel.attributs(CARACTERE_BLANC);
+
+    // En-tete tableau
+    minitel.newXY(1, 5);
+    minitel.attributs(FOND_BLEU);
+    minitel.print("   RANG  PSEUDO      SCORE          ");
+    minitel.attributs(FOND_NOIR);
+
+    for (int i = 0; i < RQ_MAX_SCORES; i++) {
+        minitel.newXY(1, 7 + i);
+        if (i == 0)       minitel.attributs(CARACTERE_JAUNE);
+        else if (i <= 2)  minitel.attributs(CARACTERE_CYAN);
+        else              minitel.attributs(CARACTERE_BLANC);
+
+        char ligne[41];
+        sprintf(ligne, "   %2d.  %-8s    %2d / %d",
+                i + 1,
+                lb[i].pseudo,
+                lb[i].points,
+                RQ_NB_QUESTIONS_PARTIE);
+        minitel.print(ligne);
+    }
+    minitel.attributs(CARACTERE_BLANC);
+    rq_pied("  SOMMAIRE ou CNX/FIN = retour accueil");
+}
+
+// ============================================================
+// ECRAN ADMIN : MOT DE PASSE
+// ============================================================
+static void rq_afficheAdminMdp() {
+    minitel.newScreen();
+    rq_bandeau();
+    currentEcran = "RQ_ADMIN_MDP";
+
+    rq_ligneH(5, '=');
+    rq_centrer("ACCES ADMINISTRATION", 6);
+    rq_ligneH(7, '=');
+
+    minitel.newXY(1, 11);
+    minitel.print("  Code d'acces : [");
+    minitel.newXY(37, 11);
+    minitel.print("]");
+
+    rq_pied("  SUITE=Valider  SOMMAIRE=Annuler");
+
+    memset(rq_mdpSaisi, 0, sizeof(rq_mdpSaisi));
+    unsigned long fin = rq_saisir(19, 11, 6, rq_mdpSaisi, true);
+
+    if ((fin == SUITE || fin == ENVOI) && strcmp(rq_mdpSaisi, RQ_MDP_ADMIN) == 0) {
+        currentEcran = "RQ_ADMIN_MENU";
+    } else {
+        if (fin != CONNEXION_FIN && fin != SOMMAIRE) {
+            minitel.newXY(1, 14);
+            minitel.attributs(CARACTERE_ROUGE);
+            rq_centrer("CODE INCORRECT !", 14);
+            minitel.attributs(CARACTERE_BLANC);
+            delay(1500);
+        }
+        currentEcran = "RQ_ACCUEIL";
+    }
+}
+
+// ============================================================
+// ECRAN ADMIN : MENU
+// ============================================================
+static void rq_afficheAdminMenu() {
+    minitel.newScreen();
+    rq_bandeau();
+    currentEcran = "RQ_ADMIN_MENU";
+
+    rq_ligneH(3, '=');
+    rq_centrer("PANNEAU DE CONTROLE", 4);
+    rq_ligneH(5, '=');
+
+    minitel.newXY(1, 8);
+    minitel.attributs(CARACTERE_VERT);
+    minitel.print("  [ 1 ]  REINITIALISER LE LEADERBOARD");
+    minitel.newXY(1, 10);
+    minitel.print("  [ 2 ]  AJOUTER UNE QUESTION");
+    minitel.newXY(1, 12);
+    minitel.print("  [ 3 ]  VOIR / MODIFIER LES QUESTIONS");
+    minitel.newXY(1, 14);
+    minitel.attributs(CARACTERE_ROUGE);
+    minitel.print("  [ 4 ]  RETOUR A L'ACCUEIL");
+    minitel.attributs(CARACTERE_BLANC);
+
+    rq_pied("  Tapez 1, 2, 3 ou 4");
+    champVide(14, 17, 20);
+}
+
+// ============================================================
+// ECRAN ADMIN : CONFIRMATION RESET LEADERBOARD
+// ============================================================
+static void rq_afficheAdminConfirmReset() {
+    minitel.newScreen();
+    rq_bandeau();
+    currentEcran = "RQ_ADMIN_RESET";
+
+    minitel.newXY(1, 8);
+    minitel.attributs(FOND_ROUGE);
+    minitel.attributs(CARACTERE_BLANC);
+    rq_centrer("ETES-VOUS SUR ?", 8);
+    minitel.newXY(1, 9);
+    rq_centrer("Cette action est irreversible !", 9);
+    minitel.attributs(FOND_NOIR);
+    minitel.newXY(1, 12);
+    rq_centrer("[ENVOI/SUITE] OUI    [RETOUR/SOM] NON", 12);
+
+    rq_pied("  ENVOI=Confirmer  SOMMAIRE=Annuler");
+    // La gestion des touches se fait dans la loop principale
+}
+
+// ============================================================
+// ECRAN ADMIN : AJOUT QUESTION (formulaire en 3 etapes)
+// ============================================================
+static void rq_afficheAdminAjout() {
+    // Etape 1 : enonce
+    minitel.newScreen();
+    rq_bandeau();
+    rq_centrer("AJOUT D'UNE QUESTION (1/3)", 3);
+    rq_ligneH(4);
+    minitel.newXY(1, 6);
+    minitel.print("  Enonce de la question :");
+    minitel.newXY(1, 8);
+    minitel.print("  > ");
+    for (int i = 0; i < 35; i++) minitel.print(".");
+    rq_pied("  SUITE=Suivant  SOMMAIRE=Annuler");
+
+    char bufEnonce[80] = "";
+    unsigned long fin = rq_saisir(5, 8, 35, bufEnonce);
+    if (fin == SOMMAIRE || fin == CONNEXION_FIN || strlen(bufEnonce) == 0) {
+        currentEcran = "RQ_ADMIN_MENU";
+        return;
+    }
+    rq_editQ.enonce = String(bufEnonce);
+
+    // Etape 2 : 4 choix
+    minitel.newScreen();
+    rq_bandeau();
+    rq_centrer("AJOUT D'UNE QUESTION (2/3)", 3);
+    rq_ligneH(4);
+    minitel.newXY(1, 5);
+    minitel.print("  Les 4 options (SUITE apres chaque) :");
+
+    const char lettres[] = {'A','B','C','D'};
+    for (int i = 0; i < 4; i++) {
+        int lig = 7 + i * 2;
+        minitel.newXY(1, lig);
+        char label[5];
+        sprintf(label, "  %c/ ", lettres[i]);
+        minitel.print(label);
+        for (int j = 0; j < 30; j++) minitel.print(".");
+
+        char bufChoix[32] = "";
+        unsigned long fc = rq_saisir(5, lig, 30, bufChoix);
+        if (fc == SOMMAIRE || fc == CONNEXION_FIN) {
+            currentEcran = "RQ_ADMIN_MENU";
+            return;
+        }
+        rq_editQ.choix[i] = (strlen(bufChoix) > 0) ? String(bufChoix) : "---";
+    }
+
+    // Etape 3 : bonne reponse
+    minitel.newScreen();
+    rq_bandeau();
+    rq_centrer("AJOUT D'UNE QUESTION (3/3)", 3);
+    rq_ligneH(4);
+    minitel.newXY(1, 7);
+    minitel.print("  Quelle est la bonne reponse ?");
+    minitel.newXY(1, 9);
+    minitel.print("  Lettre A, B, C ou D : [.]");
+    rq_pied("  SUITE=Sauvegarder  SOMMAIRE=Annuler");
+
+    char bufRep[4] = "";
+    unsigned long fr = rq_saisir(25, 9, 1, bufRep);
+    if (fr == SOMMAIRE || fr == CONNEXION_FIN) {
+        currentEcran = "RQ_ADMIN_MENU";
+        return;
+    }
+    char rep = toupper(bufRep[0]);
+    rq_editQ.bonneReponse = (rep=='A'||rep=='B'||rep=='C'||rep=='D') ? rep : 'A';
+
+    // Sauvegarde
+    if (rq_sauvegarderNouvelleQuestion(rq_editQ)) {
+        minitel.newXY(1, 13);
+        minitel.attributs(CARACTERE_VERT);
+        rq_centrer("QUESTION SAUVEGARDEE !", 13);
+        minitel.attributs(CARACTERE_BLANC);
+    } else {
+        minitel.newXY(1, 13);
+        minitel.attributs(CARACTERE_ROUGE);
+        rq_centrer("ERREUR DE SAUVEGARDE !", 13);
+        minitel.attributs(CARACTERE_BLANC);
+    }
+    delay(1500);
+    currentEcran = "RQ_ADMIN_MENU";
+}
+
+// ============================================================
+// ECRAN ADMIN : LISTE ET EDITION DES QUESTIONS
+// ============================================================
+static void rq_afficheAdminListe() {
+    RQ_Question banque[RQ_MAX_BANQUE];
+    int total = rq_chargerQuestions(banque);
+
+    minitel.newScreen();
+    rq_bandeau();
+    currentEcran = "RQ_ADMIN_LISTE";
+
+    rq_centrer("LISTE DES QUESTIONS", 3);
+    rq_ligneH(4);
 
     if (total == 0) {
-        minitel.moveCursorXY(1, 8);
-        minitel.println(centrer("Aucune question enregistree."));
-        piedPage("  [SOMMAIRE] Retour au menu admin");
-        ecranCourant = ADMIN_LISTE_QUESTIONS;
+        minitel.newXY(1, 8);
+        rq_centrer("Aucune question enregistree.", 8);
+        rq_pied("  SOMMAIRE = retour menu admin");
         return;
     }
 
-    // Pagination : 10 questions par page
-    int nbPages    = (total + 9) / 10;
-    if (pageListeAdmin >= nbPages) pageListeAdmin = 0;
-    int debut      = pageListeAdmin * 10;
-    int fin        = min(debut + 10, total);
+    int parPage = 10;
+    int nbPages = (total + parPage - 1) / parPage;
+    if (rq_pageAdmin >= nbPages) rq_pageAdmin = 0;
+    int debut = rq_pageAdmin * parPage;
+    int fin   = min(debut + parPage, total);
 
     for (int i = debut; i < fin; i++) {
-        minitel.moveCursorXY(1, 6 + (i - debut));
+        minitel.newXY(1, 6 + (i - debut));
         char ligne[41];
         String apercu = banque[i].enonce;
         if ((int)apercu.length() > 30) apercu = apercu.substring(0, 30) + "..";
         sprintf(ligne, " Q%02d: ", i + 1);
         minitel.print(ligne);
-        minitel.println(apercu);
+        minitel.print(apercu);
     }
 
-    char totalMsg[40];
-    sprintf(totalMsg, "  Total : %d question(s)  Page %d/%d",
-            total, pageListeAdmin + 1, nbPages);
-    minitel.moveCursorXY(1, 20);
-    minitel.println(totalMsg);
+    char info[41];
+    sprintf(info, "  Total: %d question(s)   Page %d/%d",
+            total, rq_pageAdmin + 1, nbPages);
+    minitel.newXY(1, 20);
+    minitel.print(info);
 
-    minitel.moveCursorXY(1, 21);
+    minitel.newXY(1, 21);
     minitel.print("  Numero a editer : [");
-    minitel.moveCursorXY(37, 21);
+    minitel.newXY(37, 21);
     minitel.print("]");
 
-    piedPage("  [SUITE] Pg.suiv  [SOMMAIRE] Menu admin");
-    ecranCourant = ADMIN_LISTE_QUESTIONS;
+    rq_pied("  Num=Editer  SUITE=Pg.suiv  SOM=Menu");
+    champVide(22, 21, 2);
 }
 
-void gererAdminListeQuestions(unsigned long touche) {
-    if (touche == SOMMAIRE) {
-        pageListeAdmin = 0;
-        afficherAdminMenu();
-        return;
-    }
-    if (touche == SUITE) {
-        pageListeAdmin++;
-        afficherAdminListeQuestions();
-        return;
-    }
-    // Chiffres 1-9 : debut de saisie du numero
-    if (touche >= '1' && touche <= '9') {
-        // Afficher le premier chiffre et lire la suite
-        char buffer[4] = { (char)touche, 0, 0, 0 };
-        minitel.moveCursorXY(22, 21);
-        minitel.print(String((char)touche));
-
-        // Lire un eventuel 2eme chiffre (pour Q10, Q11...)
-        unsigned long t2 = minitel.getKeyCode();
-        if (t2 >= '0' && t2 <= '9') {
-            buffer[1] = (char)t2;
-            buffer[2] = '\0';
-            minitel.print(String((char)t2));
-        } else if (t2 != ENVOI && t2 != SUITE) {
-            return; // Touche inconnue, on annule
-        }
-
-        int num = atoi(buffer); // numero base 1
-        if (num < 1) return;
-
-        Question banque[MAX_BANQUE_QUESTIONS];
-        int total = chargerQuestions(banque);
-        if (num > total) {
-            minitel.moveCursorXY(1, 22);
-            minitel.attributs(CARACTERE_ROUGE);
-            minitel.print("  Numero invalide !");
-            minitel.attributs(CARACTERE_BLANC);
-            delay(1000);
-            afficherAdminListeQuestions();
-            return;
-        }
-        afficherAdminEditionQuestion(num - 1); // index base 0
-    }
-}
-
-// ============================================================
-// ECRAN : ADMIN - EDITION D'UNE QUESTION EXISTANTE
-// ============================================================
-void afficherAdminEditionQuestion(int index) {
-    Question banque[MAX_BANQUE_QUESTIONS];
-    int total = chargerQuestions(banque);
+// Formulaire d'edition pre-rempli
+static void rq_afficheAdminEdition(int index) {
+    RQ_Question banque[RQ_MAX_BANQUE];
+    int total = rq_chargerQuestions(banque);
     if (index < 0 || index >= total) {
-        afficherAdminListeQuestions();
+        currentEcran = "RQ_ADMIN_LISTE";
         return;
     }
+    RQ_Question q = banque[index];
 
-    // Travailler sur une copie
-    Question q = banque[index];
-
-    // --- Etape 1 : Enonce ---
+    // Etape 1 : enonce
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-    minitel.moveCursorXY(1, 3);
+    rq_bandeau();
     char titre[41];
     sprintf(titre, "EDITION Q%02d (1/3)", index + 1);
-    minitel.println(centrer(String(titre)));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
-    minitel.moveCursorXY(1, 6);
-    minitel.println("  Enonce actuel :");
-    minitel.moveCursorXY(1, 7);
+    rq_centrer(String(titre), 3);
+    rq_ligneH(4);
+    minitel.newXY(1, 6);
+    minitel.print("  Actuel : ");
     minitel.attributs(CARACTERE_CYAN);
-    minitel.println("  " + q.enonce);
+    minitel.print(q.enonce);
     minitel.attributs(CARACTERE_BLANC);
-    minitel.moveCursorXY(1, 10);
-    minitel.println("  Nouvel enonce (ENTREE = garder) :");
-    minitel.moveCursorXY(1, 12);
+    minitel.newXY(1, 9);
+    minitel.print("  Nouveau (SUITE=garder) :");
+    minitel.newXY(1, 11);
     minitel.print("  > ");
-    for (int i = 0; i < 35; i++) minitel.print("_");
-    piedPage("  [SUITE] Suivant    [SOMMAIRE] Annuler");
+    for (int i = 0; i < 35; i++) minitel.print(".");
+    rq_pied("  SUITE=Suivant  SOMMAIRE=Annuler");
 
     char bufEnonce[80] = "";
-    unsigned long fin = saisirChaine(5, 12, 35, bufEnonce);
-    if (fin == SOMMAIRE) { afficherAdminListeQuestions(); return; }
+    unsigned long fin = rq_saisir(5, 11, 35, bufEnonce);
+    if (fin == SOMMAIRE || fin == CONNEXION_FIN) { currentEcran = "RQ_ADMIN_LISTE"; return; }
     if (strlen(bufEnonce) > 0) q.enonce = String(bufEnonce);
 
-    // --- Etape 2 : Choix A/B/C/D ---
+    // Etape 2 : choix
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-    minitel.moveCursorXY(1, 3);
+    rq_bandeau();
     sprintf(titre, "EDITION Q%02d (2/3)", index + 1);
-    minitel.println(centrer(String(titre)));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
-    minitel.moveCursorXY(1, 5);
-    minitel.println("  Actuel -> Nouveau (ENTREE = garder)");
+    rq_centrer(String(titre), 3);
+    rq_ligneH(4);
+    minitel.newXY(1, 5);
+    minitel.print("  Actuel -> Nouveau (SUITE=garder) :");
 
-    const char lettres[] = {'A', 'B', 'C', 'D'};
+    const char lettres[] = {'A','B','C','D'};
     for (int i = 0; i < 4; i++) {
-        int ligne = 7 + i * 3;
-        minitel.moveCursorXY(1, ligne);
+        int lig = 7 + i * 3;
+        minitel.newXY(1, lig);
         minitel.attributs(CARACTERE_CYAN);
-        char label[42];
-        sprintf(label, "  %c/ %s", lettres[i], q.choix[i].c_str());
-        minitel.println(label);
+        char act[38];
+        sprintf(act, "  %c/ %s", lettres[i], q.choix[i].c_str());
+        minitel.print(act);
         minitel.attributs(CARACTERE_BLANC);
-        minitel.moveCursorXY(1, ligne + 1);
+        minitel.newXY(1, lig + 1);
         minitel.print("  > ");
-        for (int j = 0; j < 30; j++) minitel.print("_");
+        for (int j = 0; j < 30; j++) minitel.print(".");
 
         char bufChoix[32] = "";
-        unsigned long fc = saisirChaine(5, ligne + 1, 30, bufChoix);
-        if (fc == SOMMAIRE) { afficherAdminListeQuestions(); return; }
+        unsigned long fc = rq_saisir(5, lig + 1, 30, bufChoix);
+        if (fc == SOMMAIRE || fc == CONNEXION_FIN) { currentEcran = "RQ_ADMIN_LISTE"; return; }
         if (strlen(bufChoix) > 0) q.choix[i] = String(bufChoix);
     }
 
-    // --- Etape 3 : Bonne reponse ---
+    // Etape 3 : bonne reponse
     minitel.newScreen();
-    bandeauTitre("3615 RETROQUIZ");
-    minitel.moveCursorXY(1, 3);
+    rq_bandeau();
     sprintf(titre, "EDITION Q%02d (3/3)", index + 1);
-    minitel.println(centrer(String(titre)));
-    minitel.moveCursorXY(1, 4);
-    ligneHorizontale('-');
-    minitel.moveCursorXY(1, 7);
-    minitel.print("  Reponse actuelle : ");
-    minitel.attributs(CARACTERE_CYAN);
-    minitel.println(String(q.bonneReponse));
-    minitel.attributs(CARACTERE_BLANC);
-    minitel.moveCursorXY(1, 9);
-    minitel.println("  Nouvelle reponse (A/B/C/D) :");
-    minitel.moveCursorXY(1, 11);
-    minitel.print("  Lettre : [_]");
-    piedPage("  [ENVOI] SAUVEGARDER    [SOMMAIRE] Annuler");
+    rq_centrer(String(titre), 3);
+    rq_ligneH(4);
+    minitel.newXY(1, 7);
+    char actRep[20];
+    sprintf(actRep, "  Reponse actuelle : %c", q.bonneReponse);
+    minitel.print(actRep);
+    minitel.newXY(1, 9);
+    minitel.print("  Nouvelle (A/B/C/D, SUITE=garder) :");
+    minitel.newXY(1, 11);
+    minitel.print("  > [.]");
+    rq_pied("  SUITE=Sauvegarder  SOMMAIRE=Annuler");
 
     char bufRep[4] = "";
-    unsigned long fr = saisirChaine(12, 11, 1, bufRep);
-    if (fr == SOMMAIRE) { afficherAdminListeQuestions(); return; }
-
+    unsigned long fr = rq_saisir(5, 11, 1, bufRep);
+    if (fr == SOMMAIRE || fr == CONNEXION_FIN) { currentEcran = "RQ_ADMIN_LISTE"; return; }
     char rep = toupper(bufRep[0]);
-    if (rep == 'A' || rep == 'B' || rep == 'C' || rep == 'D') {
-        q.bonneReponse = rep;
-    }
+    if (rep=='A'||rep=='B'||rep=='C'||rep=='D') q.bonneReponse = rep;
 
     // Sauvegarde
-    if (modifierQuestion(index, q)) {
-        minitel.moveCursorXY(1, 15);
+    if (rq_modifierQuestion(index, q)) {
+        minitel.newXY(1, 15);
         minitel.attributs(CARACTERE_VERT);
-        minitel.println(centrer("QUESTION MISE A JOUR !"));
+        rq_centrer("QUESTION MISE A JOUR !", 15);
         minitel.attributs(CARACTERE_BLANC);
     } else {
-        minitel.moveCursorXY(1, 15);
+        minitel.newXY(1, 15);
         minitel.attributs(CARACTERE_ROUGE);
-        minitel.println(centrer("ERREUR DE SAUVEGARDE !"));
+        rq_centrer("ERREUR DE SAUVEGARDE !", 15);
         minitel.attributs(CARACTERE_BLANC);
     }
     delay(1500);
-    afficherAdminListeQuestions();
+    rq_pageAdmin = 0;
+    currentEcran = "RQ_ADMIN_LISTE";
 }
 
 // ============================================================
-// SETUP & LOOP
+// SETUP DU SERVICE  (appele par launchService)
 // ============================================================
-void setup() {
-    Serial2.begin(4800); // Vitesse du Minimit
-    delay(500);
-
-    minitel.pageMode();
-    minitel.echo(false);   // Pas d'echo automatique (on gere nous-memes)
-    minitel.noCursor();
-
-    if (!initialiserStockage()) {
-        // Erreur fatale LittleFS
-        minitel.newScreen();
-        minitel.print("ERREUR SYSTEME FICHIERS !");
-        while (true) delay(1000);
-    }
-
-    afficherAccueil();
+void setupRetroquiz() {
+    Serial.println("setup RetroQuiz");
+    initMinitelService();  // pageMode + newScreen + echo(true) du Minimit
+    rq_initialiserFichiers();
+    rq_afficheAccueil();
 }
 
-void loop() {
-    unsigned long touche = minitel.getKeyCode();
-    if (touche == 0) return; // Pas de touche
+// ============================================================
+// LOOP DU SERVICE  (appele par launchService)
+// Retourne quand l'utilisateur appuie sur CNX/FIN depuis l'accueil.
+// ============================================================
+void loopRetroquiz() {
+    Serial.println("loop RetroQuiz");
 
-    switch (ecranCourant) {
-        case ACCUEIL:               gererAccueil(touche);               break;
-        case JEU:                   gererJeu(touche);                   break;
-        case CONFIRMATION_ABANDON:  gererConfirmationAbandon(touche);   break;
-        case LEADERBOARD:           gererLeaderboard(touche);           break;
-        case ADMIN_MENU:            gererAdminMenu(touche);             break;
-        case ADMIN_CONFIRM_RESET:   gererAdminConfirmReset(touche);     break;
-        case ADMIN_LISTE_QUESTIONS: gererAdminListeQuestions(touche);   break;
-        // Les ecrans de saisie (RESULTATS, ADMIN_MDP, ADMIN_AJOUT_*)
-        // sont geres directement dans leur fonction d'affichage
-        default: break;
-    }
+    while (true) {
+
+        // --- Ecrans qui se gerent via wait_for_user_action ---
+        // (ecrans sans saisie de chaine bloquante)
+        if (currentEcran == "RQ_ACCUEIL" ||
+            currentEcran == "RQ_JEU"     ||
+            currentEcran == "RQ_LEADERBOARD" ||
+            currentEcran == "RQ_ADMIN_MENU"  ||
+            currentEcran == "RQ_ADMIN_RESET" ||
+            currentEcran == "RQ_ADMIN_LISTE" ||
+            currentEcran == "RQ_ERREUR") {
+            wait_for_user_action();
+        }
+
+        // --- Transitions provoquees par les ecrans bloquants ---
+        // (les fonctions rq_affiche* ont deja change currentEcran)
+
+        if (currentEcran == "RQ_RESULTATS") {
+            rq_afficheResultats();
+            if (currentEcran == "RQ_FIN") return;
+            rq_afficheLeaderboard();
+            currentEcran = "RQ_LEADERBOARD";
+            continue;
+        }
+
+        if (currentEcran == "RQ_ADMIN_MDP") {
+            rq_afficheAdminMdp();
+            // currentEcran mis a jour dans la fonction
+            if (currentEcran == "RQ_ADMIN_MENU") rq_afficheAdminMenu();
+            else rq_afficheAccueil();
+            continue;
+        }
+
+        if (currentEcran == "RQ_ADMIN_AJOUT") {
+            rq_afficheAdminAjout();
+            rq_afficheAdminMenu();
+            continue;
+        }
+
+        // --- Machine a etats sur wait_for_user_action ---
+
+        if (currentEcran == "RQ_ACCUEIL") {
+            switch (touche) {
+                case CONNEXION_FIN: return;
+                case '1': rq_demarrerPartie(); break;
+                case '2': rq_afficheLeaderboard(); currentEcran = "RQ_LEADERBOARD"; break;
+                case '9': currentEcran = "RQ_ADMIN_MDP"; break;
+                default: champVide(14, 17, 20); break;
+            }
+        }
+
+        else if (currentEcran == "RQ_JEU") {
+            switch (touche) {
+                case CONNEXION_FIN: return;
+                case SOMMAIRE: rq_afficheAccueil(); break;
+                case 'A': case 'a':
+                    rq_reponse = 'A';
+                    minitel.newXY(30, 19);
+                    minitel.attributs(CARACTERE_JAUNE);
+                    minitel.print("A");
+                    minitel.attributs(CARACTERE_BLANC);
+                    break;
+                case 'B': case 'b':
+                    rq_reponse = 'B';
+                    minitel.newXY(30, 19);
+                    minitel.attributs(CARACTERE_JAUNE);
+                    minitel.print("B");
+                    minitel.attributs(CARACTERE_BLANC);
+                    break;
+                case 'C': case 'c':
+                    rq_reponse = 'C';
+                    minitel.newXY(30, 19);
+                    minitel.attributs(CARACTERE_JAUNE);
+                    minitel.print("C");
+                    minitel.attributs(CARACTERE_BLANC);
+                    break;
+                case 'D': case 'd':
+                    rq_reponse = 'D';
+                    minitel.newXY(30, 19);
+                    minitel.attributs(CARACTERE_JAUNE);
+                    minitel.print("D");
+                    minitel.attributs(CARACTERE_BLANC);
+                    break;
+                case SUITE: rq_validerReponse(); break;
+                default: break;
+            }
+        }
+
+        else if (currentEcran == "RQ_LEADERBOARD" || currentEcran == "RQ_ERREUR") {
+            switch (touche) {
+                case CONNEXION_FIN: return;
+                case SOMMAIRE: rq_afficheAccueil(); break;
+                default: break;
+            }
+        }
+
+        else if (currentEcran == "RQ_ADMIN_MENU") {
+            switch (touche) {
+                case CONNEXION_FIN: return;
+                case '1': rq_afficheAdminConfirmReset(); break;
+                case '2': currentEcran = "RQ_ADMIN_AJOUT"; break;
+                case '3':
+                    rq_pageAdmin = 0;
+                    rq_afficheAdminListe();
+                    break;
+                case '4': rq_afficheAccueil(); break;
+                case SOMMAIRE: rq_afficheAccueil(); break;
+                default: champVide(14, 17, 20); break;
+            }
+        }
+
+        else if (currentEcran == "RQ_ADMIN_RESET") {
+            switch (touche) {
+                case CONNEXION_FIN: return;
+                case ENVOI:
+                case SUITE:
+                    rq_reinitialiserLeaderboard();
+                    minitel.newXY(1, 15);
+                    minitel.attributs(CARACTERE_VERT);
+                    rq_centrer("LEADERBOARD REINITIALISE !", 15);
+                    minitel.attributs(CARACTERE_BLANC);
+                    delay(1500);
+                    rq_afficheAdminMenu();
+                    break;
+                case RETOUR:
+                case SOMMAIRE:
+                    rq_afficheAdminMenu();
+                    break;
+                default: break;
+            }
+        }
+
+        else if (currentEcran == "RQ_ADMIN_LISTE") {
+            switch (touche) {
+                case CONNEXION_FIN: return;
+                case SOMMAIRE: rq_afficheAdminMenu(); break;
+                case SUITE:
+                    rq_pageAdmin++;
+                    rq_afficheAdminListe();
+                    break;
+                default:
+                    // Chiffres 1-9 : debut de saisie du numero
+                    if (touche >= '1' && touche <= '9') {
+                        // Afficher le 1er chiffre deja tape
+                        minitel.newXY(22, 21);
+                        minitel.attributs(CARACTERE_JAUNE);
+                        minitel.print(String((char)touche));
+                        minitel.attributs(CARACTERE_BLANC);
+
+                        // Attendre un 2eme chiffre optionnel
+                        char buf[4] = {(char)touche, 0, 0, 0};
+                        unsigned long t2 = minitel.getKeyCode();
+                        if (t2 >= '0' && t2 <= '9') {
+                            buf[1] = (char)t2;
+                            buf[2] = '\0';
+                            minitel.print(String((char)t2));
+                        }
+                        int num = atoi(buf);
+
+                        RQ_Question banque[RQ_MAX_BANQUE];
+                        int total = rq_chargerQuestions(banque);
+                        if (num >= 1 && num <= total) {
+                            rq_afficheAdminEdition(num - 1);
+                            rq_afficheAdminListe();
+                        } else {
+                            minitel.newXY(1, 22);
+                            minitel.attributs(CARACTERE_ROUGE);
+                            minitel.print("  Numero invalide !");
+                            minitel.attributs(CARACTERE_BLANC);
+                            delay(1000);
+                            rq_afficheAdminListe();
+                        }
+                    }
+                    break;
+            }
+        }
+
+        else if (currentEcran == "RQ_FIN") {
+            return;
+        }
+
+    } // fin while(true)
 }
